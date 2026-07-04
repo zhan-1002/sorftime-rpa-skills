@@ -1,142 +1,77 @@
-"""sorftime 选市场 scraper.
+"""sorftime 选市场 scraper (multi-mode).
 
-Drives sideMarket.initData(nodeId) for each requested category and reads
-marketTrendChartData — the only reliably populated slice on the page.
+Reads `marketBoard.items` (top 20 categories per station, 246 fields each)
+from the Vue VM — no need to manually call initData(nodeId) because the
+page auto-populates this slice on initial load.
 
-Other slices (statisticalData.offlineData, marketBoard.items) appear to
-require additional UI interactions beyond the scope of free-tier scraping;
-those are documented as known limitations in SKILL.md.
+For deeper coverage, switch to the 4 sub-modes (multi / buyer / new /
+lowprice) — each fetches a different 20-category top list.
+
+Output CSV: one row per (station, sub_mode, category) with station
+metadata + all 246 raw fields prefixed.
 """
 import argparse
 import csv
+import json
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from common import (
-    SITE_TO_CODE, STATION_NAMES, DAEMON,
-    call, ensure_market_page, find_side_vm, trigger_node,
-    read_market_trend,
+    SITE_TO_CODE, STATION_NAMES, SUB_MODES,
+    call, ensure_market_page, find_market_vm, read_market_board,
+    read_market_state, wait_for_items, hide_pro_dialog, write_csv,
+    switch_market_type,
 )
 
 
-DEFAULT_CATEGORIES = [
-    "baby-products", "beauty", "health-household", "home-kitchen",
-    "kitchen-utensils-gadgets", "sports-outdoors", "toys-games",
-    "pet-supplies", "office-products", "automotive",
-]
+SESS_PREFIX = "market"
 
 
-def discover_node_ids(session):
-    """Try to read category nodes from the page's categoryListData."""
-    code = """
-    (function () {
-      const root = document.querySelector('#app');
-      const seen = new Set();
-      const visit = (n, d) => {
-        if (d > 8 || !n || seen.has(n)) return [];
-        seen.add(n);
-        const dk = n._data ? Object.keys(n._data) : [];
-        if (dk.includes('categoryListData') && Array.isArray(n._data.categoryListData)) {
-          return n._data.categoryListData.map(c => ({
-            nodeId: c.nodeId || c.id || '',
-            name: c.name || c.title || '',
-            slug: c.slug || c.url || ''
-          }));
-        }
-        let out = [];
-        if (n.$children) n.$children.forEach(c => { out = out.concat(visit(c, d+1)); });
-        return out;
-      };
-      return JSON.stringify(visit(root.__vue__, 0));
-    })()
+def fetch_station(station_code, sub_modes, sleep_after=10.0):
+    """Scrape one station across all requested sub-modes.
+
+    Strategy: navigate once per station, then for each sub_mode just
+    switch the VM's `marketType` and wait for items to repopulate.
     """
-    import json
-    import urllib.request
-    body = json.dumps({"action": "evaluate", "args": {"code": code},
-                       "session": session}).encode()
-    req = urllib.request.Request(f"{DAEMON}/command", data=body,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        res = json.loads(r.read())
-    if not res.get("ok"):
-        return []
-    data = res["data"]
-    if isinstance(data, dict) and data.get("type") == "string":
-        try:
-            return json.loads(data["value"])
-        except Exception:
-            return []
-    return data if isinstance(data, list) else []
-
-
-def fetch_station(station_code, categories, sleep_per_node=4.0):
-    """Scrape one station: navigate, discover node IDs, trigger each."""
     site_id = next((k for k, v in SITE_TO_CODE.items() if v == station_code), None)
     if site_id is None:
         print(f"[skip] unknown station {station_code}", file=sys.stderr)
         return []
 
-    print(f"[{station_code}] ensuring market page (site={site_id})...",
-          file=sys.stderr)
-    ensure_market_page(session="sorftime-market", site=site_id, sleep_after=7.0)
-
-    vm = find_side_vm("sorftime-market")
-    if not (isinstance(vm, dict) and vm.get("ok")):
-        print(f"[{station_code}] sideMarket VM not found; trying anyway",
-              file=sys.stderr)
-
-    nodes = discover_node_ids("sorftime-market")
-    if nodes:
-        print(f"[{station_code}] discovered {len(nodes)} category nodes",
-              file=sys.stderr)
-    else:
-        print(f"[{station_code}] no nodes auto-discovered; "
-              f"market page may need manual category selection",
-              file=sys.stderr)
-
-    wanted = set(categories)
-    matched = [n for n in nodes
-               if (n.get("slug") and n["slug"] in wanted)
-               or (n.get("name") and n["name"] in wanted)
-               or (n.get("nodeId") and n["nodeId"] in wanted)]
-
-    if not matched:
-        print(f"[{station_code}] none of {wanted} matched auto-discovered "
-              f"slugs; falling back to first 5 nodes", file=sys.stderr)
-        matched = nodes[:5] if nodes else []
+    session = f"{SESS_PREFIX}_{station_code.lower()}"
+    print(f"[{station_code}] navigating (site={site_id})...", file=sys.stderr)
+    ensure_market_page(session=session, site=site_id, sleep_after=sleep_after)
 
     rows = []
-    for n in matched:
-        node_id = n.get("nodeId") or n.get("id") or ""
-        name = n.get("name") or n.get("title") or ""
-        slug = n.get("slug") or ""
-        if not node_id:
-            continue
-        print(f"[{station_code}] trigger nodeId={node_id} ({name})",
+    for mode_name, mode_id in sub_modes:
+        print(f"[{station_code}] switching to sub_mode={mode_name}({mode_id})",
               file=sys.stderr)
-        trigger_node(node_id, "sorftime-market")
-        time.sleep(sleep_per_node)
-        trend = read_market_trend("sorftime-market")
-        for i, item in enumerate(trend):
-            rows.append({
+        res = switch_market_type(mode_id, session)
+        print(f"[{station_code}/{mode_name}] switch result: {res}",
+              file=sys.stderr)
+
+        if isinstance(res, dict) and res.get("changed"):
+            time.sleep(sleep_after)
+
+        hide_pro_dialog(session)
+        state = wait_for_items(session, min_count=10, max_wait=sleep_after + 5)
+        print(f"[{station_code}/{mode_name}] state: {state}", file=sys.stderr)
+
+        items = read_market_board(session)
+        print(f"[{station_code}/{mode_name}] got {len(items)} items",
+              file=sys.stderr)
+        for item in items:
+            row = {
                 "station": station_code,
                 "station_name": STATION_NAMES.get(station_code, ""),
-                "category_nodeId": node_id,
-                "category_name": name,
-                "category_slug": slug,
-                "trend_rank": i + 1,
-                "title": item.get("title", ""),
-                "item_nodeId": item.get("nodeId", ""),
-                "price_show": item.get("priceShow", ""),
-                "sale_show": item.get("saleShow", ""),
-                "search_show": item.get("searchShow", ""),
-                "pricsale_show": item.get("pricSaleShow",
-                                          item.get("pricSaleShow2", "")),
-            })
-        print(f"[{station_code}] got {len(trend)} trend items",
-              file=sys.stderr)
+                "site_id": site_id,
+                "sub_mode": mode_name,
+                "sub_mode_id": mode_id,
+            }
+            row.update(item)
+            rows.append(row)
     return rows
 
 
@@ -145,21 +80,29 @@ def main():
     p.add_argument("--station", required=True,
                    help="Comma-separated site codes (US,JP,GB,...)")
     p.add_argument("--out", required=True, help="CSV output path")
-    p.add_argument("--categories", default=",".join(DEFAULT_CATEGORIES),
-                   help="Comma-separated category slugs/names/nodeIds")
-    p.add_argument("--sleep-per-node", type=float, default=4.0)
+    p.add_argument("--sub-modes", default="multi",
+                   help="Comma-separated: multi,buyer,new,lowprice")
+    p.add_argument("--sleep-after", type=float, default=10.0,
+                   help="Seconds to wait after navigate/switch")
     args = p.parse_args()
 
     stations = [s.strip().upper() for s in args.station.split(",") if s.strip()]
-    categories = [c.strip() for c in args.categories.split(",") if c.strip()]
     if not stations:
         print("error: --station required", file=sys.stderr)
         sys.exit(2)
 
+    sub_modes = []
+    for m in args.sub_modes.split(","):
+        m = m.strip()
+        if m in SUB_MODES:
+            sub_modes.append((m, SUB_MODES[m]))
+        else:
+            print(f"warn: unknown sub_mode {m}; skipping", file=sys.stderr)
+
     all_rows = []
     for st in stations:
         try:
-            all_rows.extend(fetch_station(st, categories, args.sleep_per_node))
+            all_rows.extend(fetch_station(st, sub_modes, args.sleep_after))
         except Exception as e:
             print(f"[{st}] failed: {e}", file=sys.stderr)
 
@@ -167,22 +110,20 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     if not all_rows:
         print("no rows collected; writing empty CSV", file=sys.stderr)
-    base_fields = ["station", "station_name", "category_nodeId",
-                   "category_name", "category_slug", "trend_rank", "title",
-                   "item_nodeId", "price_show", "sale_show", "search_show",
-                   "pricsale_show"]
-    extra = []
-    seen = set(base_fields)
-    for r in all_rows:
-        for k in r.keys():
-            if k not in seen:
-                extra.append(k); seen.add(k)
-    fields = base_fields + extra
-    with out.open("w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(all_rows)
-    print(f"wrote {len(all_rows)} rows → {out}")
+    base = ["station", "station_name", "site_id", "sub_mode", "sub_mode_id",
+            "Name", "NodeId", "Number", "Url", "SaleCount", "BrandCount",
+            "AveragePrice", "SolderNumberCN", "SolderRateCN",
+            "OneMonthProductCount", "ThreeMonthProductCount", "SixMonthProductCount",
+            "NewProductCount", "NewSalesVolumeRate",
+            "OneMonthCommentCount", "OneMonthScoreCount",
+            "AmzFbaRate", "EbcRate", "FBMCount",
+            "LowPriceProductCount", "TariffValueNum", "AmazonHaul",
+            "CPCAvgPrice", "AveragePriceHB",
+            "SaleCountPrev", "SaleCountPrevThree", "SaleCountPrevTen",
+            "SolderPrev", "BrandPrev",
+            "SorfTimeNumber", "AddRate", "GrossProfitMargin"]
+    fields = write_csv(out, all_rows, base)
+    print(f"wrote {len(all_rows)} rows × {len(fields)} fields → {out}")
 
 
 if __name__ == "__main__":

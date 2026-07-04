@@ -1,12 +1,17 @@
 """Shared helpers for sorftime-market scripts.
 
-DOM-driven skill. The 选市场 page (/home/choosemarketblock) is a complex
-multi-tab dashboard showing aggregated market stats per category. Unlike
-bestseller, it has no zTree — categories are selected via a search box.
+DOM-driven skill. The 选市场 page (/home/choosemarketblock) auto-populates
+`marketBoard.items` with the top 20 categories per station on page load.
+Each item has 246 fields covering pricing, sales, brand/seller stats,
+tariff, profit, etc. This is the main data slice we use.
 
-Strategy: navigate → call sideMarket.initData(nodeId) → read populated
-arrays from Vue VM. The page populates `marketTrendChartData` (20 trend
-items per fetch) plus a few other state slices.
+Strategy: navigate → wait for databoard API to populate `marketBoard.items`
+→ read directly. No need for initData(nodeId) manual trigger.
+
+Pagination (`pageIndex=2..5`) does not actually swap items in the VM
+(verified: data fetches but items array is unchanged) — so we cap at the
+default 20 categories per station. To get more, switch the page's
+`marketType` to the other 3 sub-modes (消费需求 / 自营新品 / 低价商城).
 
 Same 14 Amazon markets, same localStorage site switching.
 """
@@ -32,6 +37,13 @@ STATION_NAMES = {
     "AE": "阿联酋", "AU": "澳大利亚", "BR": "巴西", "SA": "沙特",
 }
 
+SUB_MODES = {
+    "multi":     1,   # 多维度选市场
+    "buyer":     2,   # 消费需求选市场
+    "new":       3,   # 自营新品选市场
+    "lowprice":  4,   # 低价商城选市场
+}
+
 
 def call(action, args, session):
     body = json.dumps({"action": action, "args": args, "session": session}).encode()
@@ -54,7 +66,8 @@ def evaluate(code, session):
     return data
 
 
-def ensure_market_page(session, site=None, sleep_after=7.0):
+def ensure_market_page(session, site=None, sub_mode=None, sleep_after=8.0):
+    """Open market page. Optionally switch site (1-14) and sub_mode (1-4)."""
     if site is not None:
         call("navigate", {"url": MARKET_URL, "newTab": True,
                           "group_title": "sorftime"}, session)
@@ -66,115 +79,166 @@ def ensure_market_page(session, site=None, sleep_after=7.0):
         call("navigate", {"url": MARKET_URL, "newTab": True,
                           "group_title": "sorftime"}, session)
         time.sleep(sleep_after)
+    if sub_mode is not None:
+        switch_market_type(sub_mode, session)
 
 
-def find_side_vm(session):
-    """Return sideMarket VM (with initData / categoryListData)."""
-    code = """
-(function () {
-  const root = document.querySelector('#app');
-  let vm = null;
-  const seen = new Set();
-  const visit = (n, d) => {
-    if (d > 8 || !n || seen.has(n)) return;
-    seen.add(n);
-    const dk = n._data ? Object.keys(n._data) : [];
-    if (dk.includes('categoryListData') && dk.includes('marketType')) vm = n;
-    if (n.$children) n.$children.forEach(c => visit(c, d + 1));
-  };
-  visit(root.__vue__, 0);
-  if (!vm) return JSON.stringify({err: 'no sideMarket vm'});
-  return JSON.stringify({ok: true});
-})()
-"""
-    return evaluate(code, session)
+def switch_market_type(market_type, session):
+    """Switch to one of the 4 sub-modes (1=multi, 2=buyer, 3=new, 4=lowprice).
 
-
-def trigger_node(node_id, session):
-    """Call sideMarket.initData(nodeId) — triggers encrypted POST to
-    /api/marketboard/databoard. Returns immediately; check state after."""
+    Idempotent: if already at requested marketType, no-op.
+    """
     code = f"""
-(function () {{
-  const root = document.querySelector('#app');
-  let vm = null;
-  const seen = new Set();
-  const visit = (n, d) => {{
-    if (d > 8 || !n || seen.has(n)) return;
-    seen.add(n);
-    const dk = n._data ? Object.keys(n._data) : [];
-    if (dk.includes('categoryListData') && dk.includes('marketType')) vm = n;
-    if (n.$children) n.$children.forEach(c => visit(c, d + 1));
-  }};
-  visit(root.__vue__, 0);
-  if (!vm) return JSON.stringify({{err: 'no sideMarket vm'}});
-  vm.initData({json.dumps(node_id)});
-  return JSON.stringify({{ok: true}});
-}})()
-"""
+    (function () {{
+      const r = document.querySelector('#app');
+      const seen = new Set();
+      const visit = (n, d) => {{
+        if (d > 15 || !n || seen.has(n)) return null;
+        seen.add(n);
+        const dk = n._data ? Object.keys(n._data) : [];
+        if (dk.includes('marketBoard')) return n;
+        if (n.$children) {{
+          for (const c of n.$children) {{
+            const r = visit(c, d + 1);
+            if (r) return r;
+          }}
+        }}
+        return null;
+      }};
+      const vm = visit(r.__vue__, 0);
+      if (!vm) return JSON.stringify({{err: 'no marketBoard vm'}});
+      if (vm.marketType === {json.dumps(market_type)}) {{
+        return JSON.stringify({{ok: true, marketType: vm.marketType, changed: false}});
+      }}
+      vm.marketType = {json.dumps(market_type)};
+      return JSON.stringify({{ok: true, marketType: vm.marketType, changed: true}});
+    }})()
+    """
     return evaluate(code, session)
+
+
+def find_market_vm(session):
+    """Return the VM that owns marketBoard.items (the main category table)."""
+    code = """
+    (function () {
+      const r = document.querySelector('#app');
+      const seen = new Set();
+      const visit = (n, d) => {
+        if (d > 15 || !n || seen.has(n)) return null;
+        seen.add(n);
+        const dk = n._data ? Object.keys(n._data) : [];
+        if (dk.includes('marketBoard')) return n;
+        if (n.$children) {
+          for (const c of n.$children) {
+            const r = visit(c, d + 1);
+            if (r) return r;
+          }
+        }
+        return null;
+      };
+      const vm = visit(r.__vue__, 0);
+      return JSON.stringify({ok: !!vm});
+    })()
+    """
+    return evaluate(code, session)
+
+
+def read_market_board(session):
+    """Read the full marketBoard.items array (top-20 categories per page load).
+
+    Each item has 246 fields (Name, NodeId, SaleCount, BrandCount,
+    AveragePrice, One/Two/Three/SixMonthProductCount + Share, comment
+    counts, scores, FBA/FBM, tariff, profit, etc.).
+    """
+    code = """
+    (function () {
+      const r = document.querySelector('#app');
+      const seen = new Set();
+      const visit = (n, d) => {
+        if (d > 15 || !n || seen.has(n)) return null;
+        seen.add(n);
+        const dk = n._data ? Object.keys(n._data) : [];
+        if (dk.includes('marketBoard')) return n;
+        if (n.$children) {
+          for (const c of n.$children) {
+            const r = visit(c, d + 1);
+            if (r) return r;
+          }
+        }
+        return null;
+      };
+      const vm = visit(r.__vue__, 0);
+      if (!vm) return JSON.stringify({err: 'no marketBoard vm'});
+      const items = vm.marketBoard && vm.marketBoard.items || [];
+      return JSON.stringify(items);
+    })()
+    """
+    res = evaluate(code, session)
+    return res if isinstance(res, list) else []
 
 
 def read_market_state(session):
-    """Read all populated arrays from the market dashboard VMs."""
+    """Diagnostic: dump pagination, current pageIndex, items count, total."""
     code = """
-(function () {
-  const root = document.querySelector('#app');
-  const seen = new Set();
-  const probes = [];
-  const visit = (n, d) => {
-    if (d > 8 || !n || seen.has(n)) return;
-    seen.add(n);
-    const dk = n._data ? Object.keys(n._data) : [];
-    for (const k of dk) {
-      try {
-        const v = n._data[k];
-        if (Array.isArray(v) && v.length > 0 && v[0] && typeof v[0] === 'object') {
-          const sk = Object.keys(v[0]).slice(0, 8);
-          if (sk.some(x => /nodeId|nodeID|asin|saleCount|brand|solder|marketId|title|price/i.test(x))) {
-            probes.push({
-              d,
-              name: n.$options && (n.$options.name || n.$options._componentTag),
-              key: k,
-              len: v.length,
-              firstKeys: sk,
-              first: JSON.stringify(v[0]).slice(0, 500)
-            });
+    (function () {
+      const r = document.querySelector('#app');
+      const seen = new Set();
+      const visit = (n, d) => {
+        if (d > 15 || !n || seen.has(n)) return null;
+        seen.add(n);
+        const dk = n._data ? Object.keys(n._data) : [];
+        if (dk.includes('marketBoard')) return n;
+        if (n.$children) {
+          for (const c of n.$children) {
+            const r = visit(c, d + 1);
+            if (r) return r;
           }
         }
-      } catch (e) {}
-    }
-    if (n.$children) n.$children.forEach(c => visit(c, d + 1));
-  };
-  visit(root.__vue__, 0);
-  return JSON.stringify(probes);
-})()
-"""
+        return null;
+      };
+      const vm = visit(r.__vue__, 0);
+      if (!vm) return JSON.stringify({err: 'no vm'});
+      return JSON.stringify({
+        marketType: vm.marketType,
+        categoryLoad: vm.categoryLoad,
+        pageIndex: vm.selectAllParam && vm.selectAllParam.pageIndex,
+        pageSize: vm.selectAllParam && vm.selectAllParam.pageSize,
+        itemsLen: (vm.marketBoard && vm.marketBoard.items || []).length,
+        tbloading: vm.tbloading,
+        runStep: vm.runStep,
+        recommendMode: vm.recommendMode,
+      });
+    })()
+    """
     return evaluate(code, session)
 
 
-def read_market_trend(session):
-    """Read marketTrendChartData (the most reliably populated slice)."""
+def wait_for_items(session, min_count=10, max_wait=15.0, poll=1.0):
+    """Poll the VM until `marketBoard.items` has at least `min_count` items."""
+    elapsed = 0.0
+    last_len = 0
+    while elapsed < max_wait:
+        state = read_market_state(session)
+        if isinstance(state, dict):
+            last_len = state.get("itemsLen", 0) or 0
+            if last_len >= min_count:
+                return state
+        time.sleep(poll)
+        elapsed += poll
+    return {"itemsLen": last_len, "timed_out": True}
+
+
+def hide_pro_dialog(session):
+    """Remove the .el-overlay / .v-modal pro-upgrade dialog if present."""
     code = """
-(function () {
-  const root = document.querySelector('#app');
-  let vm = null;
-  const seen = new Set();
-  const visit = (n, d) => {
-    if (d > 8 || !n || seen.has(n)) return;
-    seen.add(n);
-    const dk = n._data ? Object.keys(n._data) : [];
-    if (dk.includes('marketTrendChartData')) vm = n;
-    if (n.$children) n.$children.forEach(c => visit(c, d + 1));
-  };
-  visit(root.__vue__, 0);
-  if (!vm) return JSON.stringify({err: 'no vm with trend chart'});
-  return JSON.stringify(vm._data.marketTrendChartData || []);
-})()
-"""
-    res = evaluate(code, session)
-    if isinstance(res, list):
-        return res
-    return res or []
+    (function () {
+      let n = 0;
+      document.querySelectorAll('.el-overlay, .v-modal, .el-dialog__wrapper')
+        .forEach(el => { try { el.remove(); n++; } catch (e) {} });
+      return JSON.stringify({removed: n});
+    })()
+    """
+    return evaluate(code, session)
 
 
 def write_csv(path, rows, base_fields):
@@ -193,3 +257,4 @@ def write_csv(path, rows, base_fields):
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
+    return fields
