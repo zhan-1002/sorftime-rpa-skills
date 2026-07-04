@@ -1,14 +1,13 @@
 """Shared helpers for sorftime-brand scripts.
 
-DOM-driven skill. The 选品牌 page (/home/choosebrand) reuses the same
-`side-Keyword` VM as the keyword page — same filter-gated behavior.
-The 11-column schema differs from keyword: brand columns focus on
-brand-level metrics (TopTypeName, SaleCount, AveragePrice,
-NewProductSaleCount, ProductCount, AvgComentCount, AvgScore,
-SaleCountPrevThree, BusySeason, CyclicalMarket).
+DOM-driven skill. The 选品牌 page (/home/choosebrand) — "**多维度品牌选品**"
+tab — DOES populate data by default! 20 brand rows in `board.items`
+of an anonymous parent VM at depth 6.
 
-Same limitation as keyword: page requires manual category dialog
-interaction to populate data. See SKILL.md for details.
+Key fact: The data lives in `_data.board.items` (NOT in `side-Keyword`'s
+empty `List`/`table.node.data` which are filter-only). The brand page
+reuses the side-Keyword filter UI but the actual default data is in
+`board`.
 
 Same 14 Amazon markets, same localStorage site switching.
 """
@@ -56,85 +55,161 @@ def evaluate(code, session):
     return data
 
 
+def hide_pro_dialog(session):
+    """Hide the Sorftime Pro upgrade dialog overlay.
+
+    The Pro dialog blocks the page (including Vue re-rendering) until
+    the user dismisses it. We need to remove it programmatically so
+    that the data tables populate.
+    """
+    code = r"""
+    (function () {
+      const allOverlays = document.querySelectorAll('div');
+      let removed = 0;
+      for (const d of allOverlays) {
+        const t = d.textContent || '';
+        if ((t.includes('购买Sorftime') || t.includes('专业版')) && t.length < 200) {
+          let p = d;
+          for (let i = 0; i < 5 && p; i++) {
+            if (p.className && (String(p.className).includes('el-overlay') || String(p.className).includes('el-dialog'))) {
+              p.style.display = 'none';
+              p.remove();
+              removed++;
+              break;
+            }
+            p = p.parentElement;
+          }
+        }
+      }
+      document.querySelectorAll('.v-modal, .el-overlay').forEach(v => { v.remove(); removed++; });
+      return JSON.stringify({ok: true, removed});
+    })()
+    """
+    return evaluate(code, session)
+
+
 def ensure_brand_page(session, site=None, sleep_after=8.0):
     if site is not None:
+        # 1) Navigate first to establishes the origin context
         call("navigate", {"url": BRAND_URL, "newTab": True,
                           "group_title": "sorftime"}, session)
         time.sleep(4.0)
+        # 2) Set localStorage AFTER navigation
         evaluate(f'localStorage.setItem("site","{site}")', session)
+        # 3) Reload so the page reads the new site
         evaluate('location.reload()', session)
         time.sleep(sleep_after)
     else:
         call("navigate", {"url": BRAND_URL, "newTab": True,
                           "group_title": "sorftime"}, session)
         time.sleep(sleep_after)
+    # Hide the Pro dialog. The Pro upgrade dialog BLOCKS page interaction
+    # AND prevents the data board from populating. Hide it BEFORE the data
+    # load window — then wait for the data to actually fill in.
+    hide_pro_dialog(session)
+    time.sleep(3.0)
 
 
-def find_side_keyword_vm(session):
-    """Return side-Keyword VM presence check.
-
-    The brand page reuses side-Keyword VM (same as keyword page).
-    """
+def find_board_vm(session):
+    """Return board VM presence check (where board.items lives)."""
     code = """
     (function () {
       const root = document.querySelector('#app');
       let vm = null;
       const seen = new Set();
       const visit = (n, d) => {
-        if (d > 9 || !n || seen.has(n)) return;
+        if (d > 15 || !n || seen.has(n)) return;
         seen.add(n);
-        const name = n.$options && (n.$options.name || n.$options._componentTag);
-        if (name === 'side-Keyword') vm = n;
+        const data = n._data || {};
+        if (!vm && data.board && Array.isArray(data.board.items) && data.board.items.length > 0) {
+          vm = n;
+        }
         if (n.$children) n.$children.forEach(c => visit(c, d + 1));
       };
       visit(root.__vue__, 0);
-      if (!vm) return JSON.stringify({err: 'no side-Keyword'});
-      return JSON.stringify({ok: true});
+      return JSON.stringify({
+        ok: true,
+        board_vm_found: !!vm,
+        items_count: vm && vm._data.board ? vm._data.board.items.length : 0,
+      });
     })()
     """
     return evaluate(code, session)
 
 
 def read_state(session):
-    """Read side-Keyword VM state on brand page."""
+    """Read brand VM state — page summary for diagnostic."""
     code = """
     (function () {
       const root = document.querySelector('#app');
       let vm = null;
       const seen = new Set();
       const visit = (n, d) => {
-        if (d > 9 || !n || seen.has(n)) return;
+        if (d > 15 || !n || seen.has(n)) return;
         seen.add(n);
-        const name = n.$options && (n.$options.name || n.$options._componentTag);
-        if (name === 'side-Keyword') vm = n;
+        const data = n._data || {};
+        if (!vm && data.board && Array.isArray(data.board.items)) {
+          vm = n;
+        }
         if (n.$children) n.$children.forEach(c => visit(c, d + 1));
       };
       visit(root.__vue__, 0);
-      if (!vm) return JSON.stringify({err: 'no side-Keyword'});
+      if (!vm) return JSON.stringify({err: 'no board VM'});
       const d = vm._data;
-      const table = d.table && d.table.node;
+      const board = d.board;
       return JSON.stringify({
         loading: d.loading,
-        table_data_len: table && table.data ? table.data.length : 0,
-        table_total: table && table.page ? table.page.totalCount : 0,
-        table_page_size: table && table.page ? table.page.pageSize : 0,
-        table_options_count: table && table.options ? table.options.length : 0,
-        table_options_props: table && table.options
-          ? table.options.map(o => o.prop) : [],
-        table_options_labels: table && table.options
-          ? table.options.map(o => o.label) : [],
-        kw_list_len: d.keywordData && d.keywordData.List
-          ? d.keywordData.List.length : 0,
-        screen_select: d.screen && d.screen.select,
-        screen_nodeData_keys: d.screen && d.screen.nodeData
-          ? Object.keys(d.screen.nodeData) : [],
+        board_items_len: board.items.length,
+        board_page: board.page,
+        board_topNum: board.topNum,
+        board_monthTopNum: board.monthTopNum,
+        board_options_count: board.options ? board.options.length : 0,
+        board_options_props: board.options
+          ? board.options.map(o => o.prop) : [],
         site: d.site,
-        first_row: table && table.data && table.data[0]
-          ? JSON.stringify(table.data[0]).slice(0, 800) : null
+        first_brand: board.items[0]
+          ? board.items[0].Brand : null,
       });
     })()
     """
     return evaluate(code, session)
+
+
+def read_board_items(session, max_items=100):
+    """Read `board.items` (20 默认品牌行).
+
+    Returns list of plain dicts. Each has Brand, BrandUrl, Id, ProductCount,
+    SellerCount, TopProductCount, TopSellerCount, TopSaleCount, TopSaleVolume,
+    TopAvgPrice, TopAvgCommentCount, TopMinSaleTime, TopProductMaxNodeId,
+    TopSaleMaxNodeId, MonthProductCount, MonthSaleCount, ImageList (top
+    ASINs), RowImage (3 display ASINs), etc.
+    """
+    code = f"""
+    (function () {{
+      const root = document.querySelector('#app');
+      let vm = null;
+      const seen = new Set();
+      const visit = (n, d) => {{
+        if (d > 15 || !n || seen.has(n)) return;
+        seen.add(n);
+        const data = n._data || {{}};
+        if (!vm && data.board && Array.isArray(data.board.items)) {{
+          vm = n;
+        }}
+        if (n.$children) n.$children.forEach(c => visit(c, d + 1));
+      }};
+      visit(root.__vue__, 0);
+      if (!vm) return JSON.stringify({{err: 'no board VM'}});
+      const items = vm._data.board.items.slice(0, {max_items});
+      return JSON.stringify(items);
+    }})()
+    """
+    result = evaluate(code, session)
+    if isinstance(result, dict) and result.get("err"):
+        return []
+    if isinstance(result, list):
+        return result
+    return []
 
 
 def write_csv(path, rows, base_fields):

@@ -1,14 +1,16 @@
 """Shared helpers for sorftime-seller scripts.
 
 DOM-driven skill. The 选卖家 page (/home/chooseseller) reuses the same
-`side-Keyword` VM as keyword/brand pages — same filter-gated behavior.
-The 11-column schema is identical to brand: Name, TopTypeName,
-SaleCount, AveragePrice, NewProductSaleCount, ProductCount,
-AvgComentCount, AvgScore, SaleCountPrevThree, BusySeason,
-CyclicalMarket.
+`side-Keyword` VM as keyword/brand pages for the filter UI, but the
+**多维度卖家选品** default tab populates `_data.sellerBoard.items`
+with 20 seller rows in an anonymous parent VM — same pattern as
+the brand page's `board.items`. No category selection needed.
 
-Same limitation as keyword/brand: page requires manual category
-dialog interaction to populate data.
+Schema: Name, Id, SolderId, SolderUrl, EnterpriseName, BusinessAddress,
+SellerNationalityOrRegion, SellerOnlineTime, FeedbackCount, ProductCount,
+AllBrandCount, BSR* group (50+ fields incl. operating categories,
+estimated monthly sales, FBA/FBM breakdown, new product stats),
+ImageData (top 10 ASINs as JSON array).
 
 Same 14 Amazon markets, same localStorage site switching.
 """
@@ -56,80 +58,155 @@ def evaluate(code, session):
     return data
 
 
+def hide_pro_dialog(session):
+    """Hide the Sorftime Pro upgrade dialog overlay.
+
+    The Pro dialog blocks the page (including Vue re-rendering) until
+    the user dismisses it. We need to remove it programmatically so
+    that the data tables populate.
+    """
+    code = r"""
+    (function () {
+      const allOverlays = document.querySelectorAll('div');
+      let removed = 0;
+      for (const d of allOverlays) {
+        const t = d.textContent || '';
+        if ((t.includes('购买Sorftime') || t.includes('专业版')) && t.length < 200) {
+          let p = d;
+          for (let i = 0; i < 5 && p; i++) {
+            if (p.className && (String(p.className).includes('el-overlay') || String(p.className).includes('el-dialog'))) {
+              p.style.display = 'none';
+              p.remove();
+              removed++;
+              break;
+            }
+            p = p.parentElement;
+          }
+        }
+      }
+      document.querySelectorAll('.v-modal, .el-overlay').forEach(v => { v.remove(); removed++; });
+      return JSON.stringify({ok: true, removed});
+    })()
+    """
+    return evaluate(code, session)
+
+
 def ensure_seller_page(session, site=None, sleep_after=8.0):
     if site is not None:
+        # 1) Navigate first to establishes the origin context
         call("navigate", {"url": SELLER_URL, "newTab": True,
                           "group_title": "sorftime"}, session)
         time.sleep(4.0)
+        # 2) Set localStorage AFTER navigation
         evaluate(f'localStorage.setItem("site","{site}")', session)
+        # 3) Reload so the page reads the new site
         evaluate('location.reload()', session)
         time.sleep(sleep_after)
     else:
         call("navigate", {"url": SELLER_URL, "newTab": True,
                           "group_title": "sorftime"}, session)
         time.sleep(sleep_after)
+    # Hide the Pro dialog. The Pro upgrade dialog BLOCKS page interaction
+    # AND prevents the data board from populating. Hide it BEFORE the data
+    # load window — then wait for the data to actually fill in.
+    hide_pro_dialog(session)
+    time.sleep(3.0)
 
 
-def find_side_keyword_vm(session):
+def find_seller_board_vm(session):
+    """Return sellerBoard VM presence check (where sellerBoard.items lives)."""
     code = """
     (function () {
       const root = document.querySelector('#app');
       let vm = null;
       const seen = new Set();
       const visit = (n, d) => {
-        if (d > 9 || !n || seen.has(n)) return;
+        if (d > 18 || !n || seen.has(n)) return;
         seen.add(n);
-        const name = n.$options && (n.$options.name || n.$options._componentTag);
-        if (name === 'side-Keyword') vm = n;
+        const data = n._data || {};
+        if (!vm && data.sellerBoard && Array.isArray(data.sellerBoard.items) && data.sellerBoard.items.length > 0) {
+          vm = n;
+        }
         if (n.$children) n.$children.forEach(c => visit(c, d + 1));
       };
       visit(root.__vue__, 0);
-      if (!vm) return JSON.stringify({err: 'no side-Keyword'});
-      return JSON.stringify({ok: true});
+      return JSON.stringify({
+        ok: true,
+        seller_board_vm_found: !!vm,
+        items_count: vm && vm._data.sellerBoard ? vm._data.sellerBoard.items.length : 0,
+      });
     })()
     """
     return evaluate(code, session)
 
 
 def read_state(session):
+    """Read sellerBoard VM state — page summary for diagnostic."""
     code = """
     (function () {
       const root = document.querySelector('#app');
       let vm = null;
       const seen = new Set();
       const visit = (n, d) => {
-        if (d > 9 || !n || seen.has(n)) return;
+        if (d > 18 || !n || seen.has(n)) return;
         seen.add(n);
-        const name = n.$options && (n.$options.name || n.$options._componentTag);
-        if (name === 'side-Keyword') vm = n;
+        const data = n._data || {};
+        if (!vm && data.sellerBoard && Array.isArray(data.sellerBoard.items)) {
+          vm = n;
+        }
         if (n.$children) n.$children.forEach(c => visit(c, d + 1));
       };
       visit(root.__vue__, 0);
-      if (!vm) return JSON.stringify({err: 'no side-Keyword'});
+      if (!vm) return JSON.stringify({err: 'no sellerBoard'});
       const d = vm._data;
-      const table = d.table && d.table.node;
+      const b = d.sellerBoard;
       return JSON.stringify({
         loading: d.loading,
-        table_data_len: table && table.data ? table.data.length : 0,
-        table_total: table && table.page ? table.page.totalCount : 0,
-        table_page_size: table && table.page ? table.page.pageSize : 0,
-        table_options_count: table && table.options ? table.options.length : 0,
-        table_options_props: table && table.options
-          ? table.options.map(o => o.prop) : [],
-        table_options_labels: table && table.options
-          ? table.options.map(o => o.label) : [],
-        kw_list_len: d.keywordData && d.keywordData.List
-          ? d.keywordData.List.length : 0,
-        screen_select: d.screen && d.screen.select,
-        screen_nodeData_keys: d.screen && d.screen.nodeData
-          ? Object.keys(d.screen.nodeData) : [],
+        seller_items_len: b.items.length,
+        seller_page: b.page,
         site: d.site,
-        first_row: table && table.data && table.data[0]
-          ? JSON.stringify(table.data[0]).slice(0, 800) : null
+        first_seller: b.items[0] ? b.items[0].Name : null,
       });
     })()
     """
     return evaluate(code, session)
+
+
+def read_seller_items(session, max_items=100):
+    """Read `sellerBoard.items` (20 默认卖家行).
+
+    Returns list of plain dicts. Each has Name, Id, SolderId, SolderUrl,
+    EnterpriseName, BusinessAddress, SellerNationalityOrRegion,
+    SellerOnlineTime, FeedbackCount, ProductCount, AllBrandCount,
+    CompareLastMonthProductCount, BSR* (50+ fields), ImageData (top
+    10 ASINs as JSON string).
+    """
+    code = f"""
+    (function () {{
+      const root = document.querySelector('#app');
+      let vm = null;
+      const seen = new Set();
+      const visit = (n, d) => {{
+        if (d > 18 || !n || seen.has(n)) return;
+        seen.add(n);
+        const data = n._data || {{}};
+        if (!vm && data.sellerBoard && Array.isArray(data.sellerBoard.items)) {{
+          vm = n;
+        }}
+        if (n.$children) n.$children.forEach(c => visit(c, d + 1));
+      }};
+      visit(root.__vue__, 0);
+      if (!vm) return JSON.stringify({{err: 'no sellerBoard'}});
+      const items = vm._data.sellerBoard.items.slice(0, {max_items});
+      return JSON.stringify(items);
+    }})()
+    """
+    result = evaluate(code, session)
+    if isinstance(result, dict) and result.get("err"):
+        return []
+    if isinstance(result, list):
+        return result
+    return []
 
 
 def write_csv(path, rows, base_fields):

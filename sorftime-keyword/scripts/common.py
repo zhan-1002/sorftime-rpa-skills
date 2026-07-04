@@ -1,28 +1,33 @@
 """Shared helpers for sorftime-keyword scripts.
 
-DOM-driven skill. The 关键词趋势选品 page (/home/choosekeyword) is a
-filter-gated keyword board. Unlike bestseller (which auto-loads on
-category click), this page requires the user to explicitly open a
-category picker dialog and select categories before any data populates.
+DOM-driven skill. The 关键词趋势选品 page (/home/choosekeyword) actually
+DOES populate data by default (20 hot keywords in `keywordData.listData`)
+even without category selection. The "filter-gated" assumption was wrong.
+
+Key fact: `keywordData.listData` lives in an anonymous parent VM at
+depth 6, NOT in the side-Keyword component (which is at depth 3 with
+empty List/table).
 
 Page state shape:
-  side-Keyword VM holds:
-    - keywordData.List   (results, empty until filter applied)
-    - table.node.data    (alt result location, empty until filter)
-    - screen.select      (selected category spec string)
-    - screen.nodeData    (selected node map)
-    - table.node.options (11-column schema, always populated)
+  Anonymous parent VM (depth 6) holds:
+    - keywordData.listData   (20 default hot keywords, populated!)
+    - keywordData.options    (column schema)
+    - keywordData.page       (pagination)
+    - screen.select          (filter spec, "" when no filter)
+    - table.node.data        (filtered results, empty by default)
+
+  side-Keyword VM (depth 3) holds:
+    - keywordData.List       (empty unless filter applied)
+    - table.node.data        (empty unless filter applied)
+    - table.node.options     (column schema)
+    - screen.select/nodeData (filter state)
 
 API endpoint (encrypted):
   POST https://api.sorftime.com/api/keywordboard/querykeywordboard?site=NN
   Body: AES-encrypted via page's app.js obfuscator
   Response: {v:3, k:"<b64>", d:"<AES ciphertext>"} decrypted by axios
-  transformResponse back into JSON
-
-This skill provides navigation + VM probe + raw decryption-via-VM
-helpers. Full reverse-engineering of the category dialog is left as
-future work — see references/api_notes.md for the unfinished
-investigation path.
+  transformResponse back into JSON. We don't call this directly — we
+  read the decrypted result from VM state.
 
 Same 14 Amazon markets, same localStorage site switching.
 """
@@ -70,6 +75,39 @@ def evaluate(code, session):
     return data
 
 
+def hide_pro_dialog(session):
+    """Hide the Sorftime Pro upgrade dialog overlay.
+
+    The Pro dialog blocks the page (including Vue re-rendering) until
+    the user dismisses it. We need to remove it programmatically so
+    that the data tables populate.
+    """
+    code = r"""
+    (function () {
+      const allOverlays = document.querySelectorAll('div');
+      let removed = 0;
+      for (const d of allOverlays) {
+        const t = d.textContent || '';
+        if ((t.includes('购买Sorftime') || t.includes('专业版')) && t.length < 200) {
+          let p = d;
+          for (let i = 0; i < 5 && p; i++) {
+            if (p.className && (String(p.className).includes('el-overlay') || String(p.className).includes('el-dialog'))) {
+              p.style.display = 'none';
+              p.remove();
+              removed++;
+              break;
+            }
+            p = p.parentElement;
+          }
+        }
+      }
+      document.querySelectorAll('.v-modal, .el-overlay').forEach(v => { v.remove(); removed++; });
+      return JSON.stringify({ok: true, removed});
+    })()
+    """
+    return evaluate(code, session)
+
+
 def ensure_keyword_page(session, site=None, sleep_after=8.0):
     """Navigate to the keyword page; optionally set site via localStorage.
 
@@ -87,38 +125,59 @@ def ensure_keyword_page(session, site=None, sleep_after=8.0):
         call("navigate", {"url": KEYWORD_URL, "newTab": True,
                           "group_title": "sorftime"}, session)
         time.sleep(sleep_after)
+    # Hide the Pro dialog that blocks the page
+    hide_pro_dialog(session)
+    time.sleep(2.0)
 
 
 def find_side_keyword_vm(session):
     """Return side-Keyword VM presence check.
 
-    side-Keyword is the master VM that owns keywordData, table, screen.
+    The `keywordData.listData` (20 default hot keywords) lives in an
+    anonymous parent VM at depth 6, not in the side-Keyword component
+    (which only has empty `List` and `table.node.data`). We look for
+    the VM that has the populated listData.
     """
     code = """
     (function () {
       const root = document.querySelector('#app');
       let vm = null;
+      let sideKw = null;
       const seen = new Set();
       const visit = (n, d) => {
-        if (d > 9 || !n || seen.has(n)) return;
+        if (d > 15 || !n || seen.has(n)) return;
         seen.add(n);
         const name = n.$options && (n.$options.name || n.$options._componentTag);
-        if (name === 'side-Keyword') vm = n;
+        const data = n._data || {};
+        if (!sideKw && name === 'side-Keyword') sideKw = n;
+        if (!vm && data.keywordData && Array.isArray(data.keywordData.listData) && data.keywordData.listData.length > 0) {
+          vm = n;
+        }
         if (n.$children) n.$children.forEach(c => visit(c, d + 1));
       };
       visit(root.__vue__, 0);
-      if (!vm) return JSON.stringify({err: 'no side-Keyword'});
-      return JSON.stringify({ok: true});
+      return JSON.stringify({
+        ok: true,
+        listData_vm_found: !!vm,
+        side_keyword_found: !!sideKw,
+      });
     })()
     """
     return evaluate(code, session)
 
 
 def read_state(session):
-    """Read side-Keyword VM state — page summary for diagnostic.
+    """Read VM state — page summary for diagnostic.
 
-    Returns dict with: loading, data_len, total_count, screen_select,
+    Returns dict with: loading, kw_listdata_len (default 20), kw_list_len
+    (often 0), table_data_len (often 0 until filter), screen_select,
     options_count (column schema), and the first row if populated.
+
+    NOTE: 选关键词 page (默认 / 趋势模式) actually has 20 default items
+    in `keywordData.listData` even when categoryLoad=false. This
+    listData is in an anonymous parent VM at depth 6, NOT in
+    side-Keyword (which is at depth 3 with empty List/table). We look
+    for whichever VM has populated listData.
     """
     code = """
     (function () {
@@ -126,14 +185,16 @@ def read_state(session):
       let vm = null;
       const seen = new Set();
       const visit = (n, d) => {
-        if (d > 9 || !n || seen.has(n)) return;
+        if (d > 15 || !n || seen.has(n)) return;
         seen.add(n);
-        const name = n.$options && (n.$options.name || n.$options._componentTag);
-        if (name === 'side-Keyword') vm = n;
+        const data = n._data || {};
+        if (!vm && data.keywordData && Array.isArray(data.keywordData.listData) && data.keywordData.listData.length > 0) {
+          vm = n;
+        }
         if (n.$children) n.$children.forEach(c => visit(c, d + 1));
       };
       visit(root.__vue__, 0);
-      if (!vm) return JSON.stringify({err: 'no side-Keyword'});
+      if (!vm) return JSON.stringify({err: 'no listData VM'});
       const d = vm._data;
       const table = d.table && d.table.node;
       const kw = d.keywordData;
@@ -144,6 +205,7 @@ def read_state(session):
         table_page_size: table && table.page ? table.page.pageSize : 0,
         table_options_count: table && table.options ? table.options.length : 0,
         kw_list_len: kw && kw.List ? kw.List.length : 0,
+        kw_listdata_len: kw && kw.listData ? kw.listData.length : 0,
         screen_select: d.screen && d.screen.select,
         screen_nodeData_keys: d.screen && d.screen.nodeData
           ? Object.keys(d.screen.nodeData) : [],
@@ -151,11 +213,52 @@ def read_state(session):
         first_row: table && table.data && table.data[0]
           ? JSON.stringify(table.data[0]).slice(0, 800) : null,
         first_kw: kw && kw.List && kw.List[0]
-          ? JSON.stringify(kw.List[0]).slice(0, 800) : null
+          ? JSON.stringify(kw.List[0]).slice(0, 800) : null,
+        first_listdata: kw && kw.listData && kw.listData[0]
+          ? JSON.stringify(kw.listData[0]).slice(0, 800) : null
       });
     })()
     """
     return evaluate(code, session)
+
+
+def read_listdata(session, max_items=200):
+    """Read `keywordData.listData` (20 默认热门词) from anonymous parent VM.
+
+    Returns list of plain dicts. Each dict has the full keyword record
+    (id, name, avgPrice, avgScore, cpc, growth rates, busySeason,
+    cyclicalMarket, asinList, cpcTrend, etc.). Empty list if no data.
+    """
+    code = f"""
+    (function () {{
+      const root = document.querySelector('#app');
+      let vm = null;
+      const seen = new Set();
+      const visit = (n, d) => {{
+        if (d > 15 || !n || seen.has(n)) return;
+        seen.add(n);
+        const data = n._data || {{}};
+        if (!vm && data.keywordData && Array.isArray(data.keywordData.listData) && data.keywordData.listData.length > 0) {{
+          vm = n;
+        }}
+        if (n.$children) n.$children.forEach(c => visit(c, d + 1));
+      }};
+      visit(root.__vue__, 0);
+      if (!vm) return JSON.stringify({{err: 'no listData VM'}});
+      const kw = vm._data.keywordData;
+      if (!kw || !kw.listData || !Array.isArray(kw.listData)) {{
+        return JSON.stringify({{err: 'no listData'}});
+      }}
+      const items = kw.listData.slice(0, {max_items});
+      return JSON.stringify(items);
+    }})()
+    """
+    result = evaluate(code, session)
+    if isinstance(result, dict) and result.get("err"):
+        return []
+    if isinstance(result, list):
+        return result
+    return []
 
 
 def write_csv(path, rows, base_fields):

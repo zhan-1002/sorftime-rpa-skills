@@ -1,30 +1,34 @@
 ---
 name: sorftime-keyword
-description: Probe sorftime 关键词趋势选品 (/home/choosekeyword) page state across 14 Amazon marketplaces (US/GB/DE/FR/IN/CA/JP/ES/IT/MX/AE/AU/BR/SA). DOM-driven skill that navigates + probes the side-Keyword Vue VM to read whatever keyword data is currently populated. NOTE: this page is filter-gated — unlike bestseller/product which auto-load, the keyword board only populates after the user manually opens the 类目 dialog and selects categories. The skill reads populated rows when available and emits a state summary CSV documenting which stations need further UI interaction. Full UI-flow automation (open tree dialog → select categories → close → trigger loadKeyword) is left as future work.
+description: Scrape sorftime 关键词趋势选品 (/home/choosekeyword) page across 14 Amazon marketplaces. DOM-driven skill that reads 20 default hot keywords from the keywordData.listData Vue VM field (no category selection needed). Outputs one CSV row per keyword with avg price, score, review, growth rates, CPC, brand/competitor counts, etc.
 ---
 
 # sorftime-keyword
 
-Probe **Amazon keyword trend board** from **sorftime 关键词趋势选品** (`/home/choosekeyword`).
+Scrape **Amazon hot keywords** from **sorftime 关键词趋势选品** (`/home/choosekeyword`).
 
-This page is a filter-gated keyword board. The default UI shows "已选全部类目" (all categories selected) in the filter chip, but the underlying `side-Keyword.keywordData.List` is empty until a user explicitly opens the 「类目」tree dialog and picks specific categories.
+## Breakthrough (2026-07-04)
 
-**This skill is diagnostic-focused**: it navigates, probes the Vue VM state, and reads whatever data IS populated. For full automation (programmatic category selection), see `references/api_notes.md` for the unfinished investigation path.
+**The page DOES populate data by default** — no category selection required. The 20 hot keywords in `keywordData.listData` (note: lowercase `l`) load on page navigation. The previous "filter-gated" assumption was wrong because:
+
+1. The data lives in an **anonymous parent VM at depth 6**, not in the `side-Keyword` component (which is at depth 3 with empty `List`/`table`).
+2. The default filter shows the latest week's hot keywords for that site.
 
 ## Quick start
 
 ```bash
-# Single station probe
+# Single station
 python scripts/fetch_keywords.py --station US \
-    --out data/us_keyword_state.csv
+    --out data/keyword_us.csv
 
-# Multi-station probe
+# Multi-station
 python scripts/fetch_keywords.py --station US,JP,GB \
-    --out data/keyword_state.csv
+    --out data/keywords_3sites.csv \
+    --summary data/keywords_3sites_summary.csv
 
-# Generate state report
-python scripts/analyze.py --keywords data/keyword_state.csv \
-    --out-md reports/keyword_state.md
+# Generate analyze report
+python scripts/analyze.py --keywords data/keywords_3sites.csv \
+    --out-md reports/keyword_analysis.md
 ```
 
 ## Requirements
@@ -35,78 +39,91 @@ python scripts/analyze.py --keywords data/keyword_state.csv \
 
 ## What you get
 
-A CSV with one row per station, summarizing the side-Keyword VM state:
+A CSV with **one row per keyword** (20 rows per station by default).
 
 | Field | Meaning |
 |---|---|
 | `station` / `station_name` | Amazon marketplace code + 中文 |
-| `vm_found` | Whether side-Keyword VM was located (true/false) |
-| `loading` | Page's loading flag |
-| `table_data_len` | Rows in `table.node.data` (0 if filter not applied) |
-| `table_total_count` | `page.totalCount` |
-| `column_count` | Number of columns in `table.node.options` (always ~11) |
-| `screen_select` | Selected categories string (empty if nothing picked) |
-| `screen_nodeData_keys` | Comma-separated selected node IDs |
-| `site` | The numeric site code |
-| `sample_row_json` | First row JSON if populated |
+| `site` | Numeric site code (1=US, 7=JP, ...) |
+| `rank` | Position in the listData array (1-20) |
+| `name` | Keyword name (e.g. "kindle", "冷蔵庫", "mini fridge") |
+| `id` | Sorftime internal keyword id |
+| `avg_price` | Average product price for this keyword |
+| `avg_score` | Average review score |
+| `avg_review` | Average review count |
+| `avg_comment_count` | Average comment count (alias field) |
+| `brand_count` | Number of brands competing |
+| `competitor_count` | Number of competing products |
+| `coverage_count` | Coverage ratio |
+| `buy_rate` | Buy box rate % |
+| `cpc_storm` / `cpc_low` / `cpc_high` | Sponsored product CPC |
+| `growth_3m` / `growth_6m` / `growth_12m` | Growth rate % |
+| `buy_monopoly` | Buy box monopoly % |
+| `fall_type_str` | Search volume bucket ("200万+", "30万+", etc.) |
+| `busy_season` | JSON array of busy months |
+| `cyclical_market` | Cyclical market info |
+| `extend_word_count` | Number of related keyword extensions |
+
+Sample output (US site, top 5 by CPC):
+```
+rank,name,avg_price,avg_score,competitor_count,growth_3m,cpc_storm
+1,kindle,92.97,4.32,112635,2.55,0.35
+2,ipad,150.37,4.43,62657,-0.95,0.93
+3,apple watch,93.22,4.38,38922,-0.92,0.62
+4,airpods,81.23,4.35,15244,3.21,0.96
+5,laptop,496.45,4.35,126377,-1.61,1.29
+```
 
 ## CLI flags
 
 | Flag | Notes |
 |---|---|
-| `--station` | Required. Comma-separated site codes |
-| `--out` | Required. CSV output path |
-| `--sleep` | Page init sleep (default 8.0s) |
+| `--station` | Required. Comma-separated site codes (US,JP,GB,...) |
+| `--out` | Required. CSV output path (data rows) |
+| `--summary` | Optional. Per-station summary CSV |
+| `--sleep` | Page init sleep (default 12.0s — keyword page is heavy) |
+
+## How it works
+
+1. **Navigate** to `/home/choosekeyword` in a new tab
+2. **Set site** via `localStorage.setItem("site", "<code>")` + reload
+3. **Wait 12s** for Vue to mount + 5-8s for default data load
+4. **Walk Vue tree** looking for any VM with `keywordData.listData.length > 0`
+5. **Extract 20 items** with key fields, write to CSV
+
+The data comes from `keywordData.listData` (lowercase `l`), an array in an anonymous parent VM. The `side-Keyword` component (at depth 3) is misleading because it has its own empty `List` and `table.node.data`.
 
 ## Gotchas
 
-1. **Filter-gated page**: this is the ONLY sorftime 选品 page that doesn't auto-populate on navigation. The other 5 (bestseller, product, market, brand, seller) all load data on page nav or single-click category trigger.
+1. **ListData, not List**: use `keywordData.listData` (lowercase l), not `keywordData.List` (capital L). The latter is the filter result, which is empty by default.
 
-2. **DOM-driven (encrypted API)**: POST to `/api/keywordboard/querykeywordboard?site=NN` with AES-encrypted body. Response is also encrypted (`{v:3, k, d}` format). We can't call this directly; the VM-driven approach reads post-decryption state from Vue.
+2. **Anonymous VM, not side-Keyword**: don't look for the data in `side-Keyword._data`. The data is in an anonymous parent VM at depth 6.
 
-3. **UI flow needed for data**: to actually populate keyword rows, the user must:
-   - Click the 「类目」chip in the filter bar
-   - In the popover dialog, navigate the category tree
-   - Tick specific categories
-   - Click confirm
-   - Then `keywordData.List` populates from the encrypted response
+3. **Page init 12s**: the keyword page is heavier than bestseller; the 20 default keywords take ~5-8s to load after Vue mounts. Use `--sleep 12` to be safe.
 
-4. **Pagination 20/page**: when data IS populated, default page size is 20.
+4. **20 items per page**: the default `listData` has 20 entries. Pagination via `keywordData.page.pageIndex` may give more — not yet implemented in scraper.
 
-5. **Column schema fixed**: `table.node.options` is an 11-column schema including Top, SearchVolume, SearchConversionRate, KeywordTrend, TopDiff, etc. These are always populated regardless of data state.
+5. **Encrypted API**: POST to `/api/keywordboard/querykeywordboard?site=NN` is AES-encrypted (body + response). We don't call this directly; we read post-decryption state from Vue.
 
 6. **`sideMarket` VM also present**: keyword page has a `sideMarket` VM at depth ~5 with `categoryListData` (empty until category dialog opens). This is the same VM as the market page.
 
 7. **14 sites (not 10)**: US/GB/DE/FR/IN/CA/JP/ES/IT/MX/AE/AU/BR/SA.
 
-8. **localStorage site switching**: same as bestseller — `localStorage["site"]` then reload.
+8. **localStorage site switching**: same as other skills — `localStorage["site"]` then reload.
 
-9. **Page init 8s**: keyword page is heavier than bestseller (more sub-VMs, more dialogs); use `--sleep 8`.
-
-## When this skill returns empty data
-
-The CSV will show `table_data_len=0` for stations where the category dialog hasn't been used. To get real data:
-
-1. Open sorftime in browser
-2. Navigate to `/home/choosekeyword`
-3. Manually open 「类目」dialog and select categories
-4. Run `fetch_keywords.py` while that browser session is still active
-5. The script reads the now-populated VM state
-
-For programmatic category selection, see `references/api_notes.md` (unfinished investigation).
-
-## Architecture note
+## Architecture
 
 | | keyword | bestseller | product |
 |---|---|---|---|
-| Filter gated | YES (UI dialog needed) | NO (auto) | NO (auto) |
-| Per fetch | variable (often 0 without UI) | 100 ASINs | ~20 unmasked |
-| Surface | Diagnostic only | Full TOP100 | Partial (ASIN-mask) |
+| Auto-load on nav | **YES** (20 hot keywords) | YES (per category click) | YES (full list) |
+| Per fetch | 20 keywords (default mode) | 100 ASINs | ~20 unmasked |
+| Need UI flow | NO | NO | NO |
+| Surface | Full (avg price, CPC, growth) | Full TOP100 | Partial (ASIN-mask) |
 
 ## See also
 
-- `references/api_notes.md` — encrypted API + unfinished UI-flow investigation
+- `references/api_notes.md` — encrypted API + VM architecture
 - `references/environment.md` — Windows/bash/jq/heredoc quirks
-- `references/analysis_recipe.md` — state report template
-- `scripts/fetch_keywords.py` — main scraper (state probe)
-- `scripts/analyze.py` — multi-station state report generator
+- `references/analysis_recipe.md` — analysis report template
+- `scripts/fetch_keywords.py` — main scraper
+- `scripts/analyze.py` — multi-station report generator
