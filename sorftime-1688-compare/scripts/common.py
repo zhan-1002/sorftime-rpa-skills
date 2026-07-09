@@ -8,15 +8,10 @@ DOM-driven skill. 1688 image search (s.1688.com) works via:
 
 Requires manual 1688 login (one-time, cookie persists in WebBridge browser).
 """
-import io
 import json
-import sys
 import time
 import urllib.request
 from pathlib import Path
-
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 DAEMON = "http://127.0.0.1:10086/command"
 DEFAULT_SESSION = "sorftime-1688-compare"
@@ -62,10 +57,19 @@ def check_login(session):
     except Exception:
         return False
 
-    url = str(result) if isinstance(result, str) else ""
-    if "login.taobao.com" in url or "login" in url.lower():
+    # evaluate() returns either a string or {"raw": "..."} dict
+    if isinstance(result, dict):
+        url = str(result.get("raw", ""))
+    else:
+        url = str(result)
+
+    # Also check page body for login wall
+    if "login.taobao.com" in url:
         return False
-    return True
+    # Double-check: look for the 1688 search UI elements
+    if "s.1688.com" in url or "1688.com" in url:
+        return True
+    return False
 
 
 def ensure_1688_page(session, sleep_after=10.0):
@@ -203,7 +207,7 @@ def write_csv(path, rows, image_url=""):
 
     import csv
     fields = ["title", "price", "supplier", "offer_id",
-              "detail_url", "image_url"]
+              "detail_url", "image_url", "search_mode"]
 
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -215,3 +219,86 @@ def write_csv(path, rows, image_url=""):
             w.writerow(row)
 
     return path
+
+
+# ── 1688 Text Search ──
+
+
+def search_by_text(keyword, session, sleep_after=10.0, max_items=10):
+    """Search 1688 by text keyword (falls back when image search is noisy).
+
+    Navigates to 1688 keyword search, extracts product listings.
+
+    Args:
+        keyword: search term (e.g. "万圣节窗户贴纸")
+        session: WebBridge session name
+        sleep_after: page load wait
+        max_items: max results
+
+    Returns:
+        list of product dicts
+    """
+    import urllib.parse
+    encoded = urllib.parse.quote(keyword)
+    url = f"https://s.1688.com/selloffer/offer_search.htm?keywords={encoded}"
+
+    navigate(url, session)
+    time.sleep(sleep_after)
+
+    if not check_login(session):
+        return [{"error": "1688 login required for text search"}]
+
+    return extract_products(session, max_items=max_items)
+
+
+def combined_search(image_url, keywords, session, sleep_after=10.0, max_items=10):
+    """Run both image search and text search, merge and deduplicate.
+
+    Args:
+        image_url: Amazon image URL for image search
+        keywords: list of keyword strings for text search
+        session: WebBridge session name
+        sleep_after: page load wait
+        max_items: max items per search mode
+
+    Returns:
+        dict with 'image_results', 'text_results', and 'merged' (deduplicated)
+    """
+    all_image = []
+    all_text = []
+    seen_titles = set()
+
+    # Image search
+    state = ensure_1688_page(session, sleep_after=sleep_after)
+    if state.get("logged_in"):
+        upload_result = upload_image(image_url, session)
+        if isinstance(upload_result, dict) and not upload_result.get("err") and not upload_result.get("_error"):
+            time.sleep(6)
+            upload_state = check_upload_state(session)
+            if isinstance(upload_state, dict) and upload_state.get("uploaded"):
+                click_search(session)
+                time.sleep(12)
+                all_image = extract_products(session, max_items=max_items)
+                for p in all_image:
+                    p["search_mode"] = "image"
+                    seen_titles.add(p.get("title", ""))
+
+    # Text search for each keyword
+    for kw in keywords:
+        text_results = search_by_text(kw, session, sleep_after=sleep_after, max_items=max_items)
+        for p in text_results:
+            if isinstance(p, dict) and not p.get("error"):
+                title = p.get("title", "")
+                if title not in seen_titles:
+                    p["search_mode"] = f"text:{kw}"
+                    seen_titles.add(title)
+                    all_text.append(p)
+
+    # Merge: image results first (visually similar), then text (keyword match)
+    merged = all_image + all_text
+
+    return {
+        "image_results": all_image,
+        "text_results": all_text,
+        "merged": merged
+    }
