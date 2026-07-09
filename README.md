@@ -181,5 +181,62 @@ sorftime-rpa 复用了这两个项目的 DOM-driven 模式和报告模板。
 
 
 
-### 特别感谢：
-https://linux.do 社区佬友
+## Fork 新增
+
+本仓库在原始项目基础上新增了 **Amazon → 1688 比价闭环**，将选品调研流程延伸至供应链端。
+
+### 新增模块
+
+| Skill | 功能 | 输入 | 输出 |
+|---|---|---|---|
+| **sorftime-1688-compare** | Amazon 图片 → 1688 以图搜图 → 供应商比价 | Amazon 商品图片 URL | 1688 供应商列表（报价/销量/回头率/链接）+ FBA 利润测算 |
+
+### 完整调研流程
+
+```
+sorftime 选品调研 → 发现潜力品类
+       │
+       ▼
+Amazon 搜索 → 提取真实 ASIN → sorftime 反查销量/评价/FBA
+       │
+       ▼
+sorftime-1688-compare → 提取主图 → 1688 以图搜同款
+       │
+       ▼
+供应商对比 + FBA 利润计算 → 可做性判断
+```
+
+### 使用示例
+
+```bash
+# 搜 Amazon 商品图片在 1688 的同款供应商
+python .claude/skills/sorftime-1688-compare/scripts/fetch_1688.py \
+    --image-url "https://m.media-amazon.com/images/I/XXXXX.jpg" \
+    --out data/1688_results.csv
+
+# 生成供应商对比 + FBA 利润报告
+python .claude/skills/sorftime-1688-compare/scripts/analyze.py \
+    --results data/1688_results.csv \
+    --amz-price 8.99 \
+    --out-md reports/compare_report.md
+```
+
+### 技术要点
+
+- **1688 以图搜图**：通过 `fetch()` + `DataTransfer` 绕过浏览器文件对话框限制，将 Amazon 图片注入 1688 的图片搜索
+- **登录检测**：`check_login()` 门控函数检测 1688 登录状态，未登录时提示用户
+- **FBA 利润公式**：复用 FBA 选品利润计算表（采购价/头程/FBA费/佣金）
+- **供应商链接**：自动构建 `detail.1688.com/offer/{id}.html` 产品详情页
+
+### 已知限制
+
+- 1688 需要手动登录（一次性，cookie 持久化在 WebBridge 浏览器中）
+- 1688 图搜按颜色/形状匹配，可能返回视觉相似但品类无关的结果
+- 仅支持 US 站
+
+---
+
+### 致谢
+
+- 原始项目作者 [liangdabiao](https://github.com/liangdabiao) — 感谢开源的 sorftime-rpa-skills 项目
+- https://linux.do 社区佬友
