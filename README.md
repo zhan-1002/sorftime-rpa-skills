@@ -232,7 +232,6 @@ python .claude/skills/sorftime-1688-compare/scripts/analyze.py \
 
 - 1688 需要手动登录（一次性，cookie 持久化在 WebBridge 浏览器中）
 - 1688 图搜按颜色/形状匹配，可能返回视觉相似但品类无关的结果
-- 仅支持 US 站
 
 ---
 
