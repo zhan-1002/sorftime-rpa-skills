@@ -187,9 +187,10 @@ sorftime-rpa 复用了这两个项目的 DOM-driven 模式和报告模板。
 
 ### 新增模块
 
-| Skill | 功能 | 输入 | 输出 |
+| 模块 | 功能 | 输入 | 输出 |
 |---|---|---|---|
 | **sorftime-1688-compare** | Amazon 图片 → 1688 以图搜图 → 供应商比价 | Amazon 商品图片 URL | 1688 供应商列表（报价/销量/回头率/链接）+ FBA 利润测算 |
+| **[us-patent-mcp](https://github.com/zhan-1002/us-patent-mcp-for-china-ecommerce)** | 美国专利检索（外观/实用新型） | 产品名称、关键特征、产品图片 | 多策略专利搜索报告（标题/发明人/申请人追踪） |
 
 ### 完整调研流程
 
@@ -199,12 +200,37 @@ sorftime 选品调研 → 发现潜力品类
        ▼
 Amazon 搜索 → 提取真实 ASIN → sorftime 反查销量/评价/FBA
        │
-       ▼
-sorftime-1688-compare → 提取主图 → 1688 以图搜同款
-       │
-       ▼
-供应商对比 + FBA 利润计算 → 可做性判断
+       ├──────────────┬──────────────┐
+       ▼              ▼              ▼
+  1688 供应商比价   利润测算      专利排查
+  (sorftime-       (FBA 利润     (us-patent-mcp
+   1688-compare)    计算表)       外观/实用新型)
+       │              │              │
+       └──────────────┴──────────────┘
+                      │
+                      ▼
+          综合可做性判断（利润 + 竞争 + 专利风险）
 ```
+
+### 专利排查
+
+通过 [us-patent-mcp-for-china-ecommerce](https://github.com/zhan-1002/us-patent-mcp-for-china-ecommerce) MCP 服务器在 Claude Code 中直接检索美国专利：
+
+```bash
+# 安装专利 MCP 工具
+git clone https://github.com/zhan-1002/us-patent-mcp-for-china-ecommerce.git
+cd us-patent-mcp-for-china-ecommerce && uv sync
+
+# 配置到 Claude Code
+claude mcp add-json patents '{"command": "uv", "args": ["--directory", "/path/to/us-patent-mcp-for-china-ecommerce", "run", "patent-mcp-server"]}'
+```
+
+配置后在 Claude Code 中对话即可触发专利检索：
+```
+帮我搜索这个产品的专利：万圣节窗户静电贴纸，南瓜幽灵蝙蝠图案，可重复使用无胶静电吸附
+```
+
+专利 MCP 会自动执行多策略搜索（标题精确匹配、关键词组合、发明人追踪、申请人追踪），输出专利风险评估报告。
 
 ### 使用示例
 
