@@ -225,12 +225,20 @@ cd us-patent-mcp-for-china-ecommerce && uv sync
 claude mcp add-json patents '{"command": "uv", "args": ["--directory", "/path/to/us-patent-mcp-for-china-ecommerce", "run", "patent-mcp-server"]}'
 ```
 
-配置后在 Claude Code 中对话即可触发专利检索：
+配置后在 Claude Code 中对话即可触发专利检索，提供以下信息可获得最佳搜索效果：
+
 ```
-帮我搜索这个产品的专利：万圣节窗户静电贴纸，南瓜幽灵蝙蝠图案，可重复使用无胶静电吸附
+帮我搜索这个产品的专利：
+- 产品名称：Self Watering Pots with Water Level Indicator（可以直接复制亚马逊标题）
+- 关键特征：水位指示器、可拆卸底座（补充说明产品功能特征有利于搜索隐藏专利）
+- 产品图片：上传产品图片用于模型视觉分析
 ```
 
-专利 MCP 会自动执行多策略搜索（标题精确匹配、关键词组合、发明人追踪、申请人追踪），输出专利风险评估报告。
+提供三要素（产品名称、关键特征、图片）后，MCP 会自动：
+1. 分析产品关键特征
+2. 构建多策略搜索关键词（标题精确匹配、全文关键词组合）
+3. 执行搜索并追踪发明人/申请人关联专利
+4. 输出专利风险评估报告
 
 ### 使用示例
 
